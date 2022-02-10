@@ -8,6 +8,7 @@ import io.fabric8.kubernetes.api.model.OwnerReference;
 import io.fabric8.kubernetes.api.model.Secret;
 import io.fabric8.kubernetes.api.model.SecretBuilder;
 import io.strimzi.api.kafka.model.CertificateExpirationPolicy;
+import io.strimzi.api.kafka.model.KafkaResources;
 import io.strimzi.certs.CertAndKey;
 import io.strimzi.certs.CertManager;
 import io.strimzi.certs.SecretCertProvider;
@@ -511,19 +512,27 @@ public abstract class Ca {
         Map<String, String> keyData;
         int caCertGeneration = certGeneration();
         int caKeyGeneration = keyGeneration();
+
+        LOGGER.infoCr(reconciliation, "generateCA: " + generateCa);
+        
         if (!generateCa) {
+
             certData = caCertSecret != null ? caCertSecret.getData() : emptyMap();
             keyData = caKeySecret != null ? singletonMap(CA_KEY, caKeySecret.getData().get(CA_KEY)) : emptyMap();
             renewalType = hasCaCertGenerationChanged() ? RenewalType.REPLACE_KEY : RenewalType.NOOP;
             caCertsRemoved = false;
+
         } else {
             this.renewalType = shouldCreateOrRenew(currentCert, namespace, clusterName, maintenanceWindowSatisfied);
             LOGGER.debugCr(reconciliation, "{} renewalType {}", this, renewalType);
+            LOGGER.infoCr(reconciliation, "renewalType:" + renewalType);
+            
             switch (renewalType) {
                 case CREATE:
                     keyData = new HashMap<>(1);
-                    certData = new HashMap<>(3);
+                    certData = new HashMap<>(5);
                     generateCaKeyAndCert(nextCaSubject(caKeyGeneration), keyData, certData);
+                    
                     break;
                 case REPLACE_KEY:
                     keyData = new HashMap<>(1);
@@ -535,12 +544,14 @@ public abstract class Ca {
                     }
                     ++caCertGeneration;
                     generateCaKeyAndCert(nextCaSubject(++caKeyGeneration), keyData, certData);
+
                     break;
                 case RENEW_CERT:
                     keyData = caKeySecret.getData();
                     certData = new HashMap<>(3);
                     ++caCertGeneration;
                     renewCaCert(nextCaSubject(caKeyGeneration), certData);
+
                     break;
                 default:
                     keyData = caKeySecret.getData();
@@ -549,9 +560,15 @@ public abstract class Ca {
                     if (!certData.containsKey(CA_STORE)) {
                         addCertCaToTrustStore(CA_CRT, certData);
                     }
+
             }
+
             this.caCertsRemoved = removeExpiredCerts(certData) > 0;
         }
+
+        addBootstrapServerAddress(certData);
+        LOGGER.infoCr(reconciliation, "certData:" + certData.keySet());
+
         SecretCertProvider secretCertProvider = new SecretCertProvider();
 
         if (caCertsRemoved) {
@@ -579,9 +596,12 @@ public abstract class Ca {
                 && Annotations.hasAnnotation(caKeySecret, ANNO_STRIMZI_IO_FORCE_REPLACE))   {
             keyAnnotations.put(ANNO_STRIMZI_IO_FORCE_REPLACE, Annotations.stringAnnotation(caKeySecret, ANNO_STRIMZI_IO_FORCE_REPLACE, "false"));
         }
-
+        //여기서 createSecret 사용하는듯????? SecretCertProvider 파일 내에 있는 메서드
+        
         caCertSecret = secretCertProvider.createSecret(namespace, caCertSecretName, certData, Util.mergeLabelsOrAnnotations(labels, additonalLabels),
                 Util.mergeLabelsOrAnnotations(certAnnotations, additonalAnnotations), ownerRef);
+
+        LOGGER.infoCr(reconciliation, "certData:" + certData.keySet());
 
         caKeySecret = secretCertProvider.createSecret(namespace, caKeySecretName, keyData, labels,
                 keyAnnotations, ownerRef);
@@ -763,28 +783,14 @@ public abstract class Ca {
      * @return the generation of the current CA certificate
      */
     public int certGeneration() {
-        if (caCertSecret != null) {
-            if (!Annotations.hasAnnotation(caCertSecret, ANNO_STRIMZI_IO_CA_CERT_GENERATION)) {
-                LOGGER.warnOp("Secret {}/{} is missing generation annotation {}",
-                        caCertSecret.getMetadata().getNamespace(), caCertSecret.getMetadata().getName(), ANNO_STRIMZI_IO_CA_CERT_GENERATION);
-            }
-            return Annotations.intAnnotation(caCertSecret, ANNO_STRIMZI_IO_CA_CERT_GENERATION, INIT_GENERATION);
-        }
-        return INIT_GENERATION;
+        return caCertSecret != null ? Annotations.intAnnotation(caCertSecret, ANNO_STRIMZI_IO_CA_CERT_GENERATION, INIT_GENERATION) : INIT_GENERATION;
     }
 
     /**
      * @return the generation of the current CA key
      */
     public int keyGeneration() {
-        if (caKeySecret != null) {
-            if (!Annotations.hasAnnotation(caKeySecret, ANNO_STRIMZI_IO_CA_KEY_GENERATION)) {
-                LOGGER.warnOp("Secret {}/{} is missing generation annotation {}",
-                        caKeySecret.getMetadata().getNamespace(), caKeySecret.getMetadata().getName(), ANNO_STRIMZI_IO_CA_KEY_GENERATION);
-            }
-            return Annotations.intAnnotation(caKeySecret, ANNO_STRIMZI_IO_CA_KEY_GENERATION, INIT_GENERATION);
-        }
-        return INIT_GENERATION;
+        return caKeySecret != null ? Annotations.intAnnotation(caKeySecret, ANNO_STRIMZI_IO_CA_KEY_GENERATION, INIT_GENERATION) : INIT_GENERATION;
     }
 
     private int removeExpiredCerts(Map<String, String> newData) {
@@ -970,6 +976,7 @@ public abstract class Ca {
                         trustStorePassword = passwordGenerator.generate();
                     }
                     try {
+                        
                         certManager.generateSelfSignedCert(keyFile, certFile, subject, validityDays);
                         certManager.addCertToTrustStore(certFile, CA_CRT, trustStoreFile, trustStorePassword);
                         CertAndKey ca = new CertAndKey(
@@ -1066,5 +1073,16 @@ public abstract class Ca {
             return caCertGenerationAnno != null && Integer.parseInt(caCertGenerationAnno) != currentCaCertGeneration;
         }
         return false;
+    }
+
+    private void addBootstrapServerAddress(Map<String, String> certData) {
+
+        String bootstrapServiceName = KafkaResources.bootstrapServiceName(reconciliation.name()) + "." + reconciliation.namespace() + ".svc";
+        String plainBootstrapServiceAddress = bootstrapServiceName + ":9092";
+        String tlsBootstrapServiceAddress = bootstrapServiceName + ":9093";
+
+        certData.put("PLAIN_BOOTSTRAP_SERVERS", Base64.getEncoder().encodeToString(plainBootstrapServiceAddress.getBytes()));
+        certData.put("TLS_BOOTSTRAP_SERVERS", Base64.getEncoder().encodeToString(tlsBootstrapServiceAddress.getBytes()));
+
     }
 }
